@@ -65,6 +65,23 @@ public:
     format_inspector_.Inspect(GetMTLDevice());
   }
 
+  ~MTLD3D11DeviceImpl() {
+    /* A committed chunk is encoded later, on the command queue's encoding
+     * thread, and its commands point at objects this device owns without
+     * holding a reference to them: the compiled pipelines in pipeline_cache_
+     * (FinalizeCurrentRenderPipeline() captures a raw
+     * MTLCompiledGraphicsPipeline*), the sampler, rasterizer and
+     * depth-stencil state caches, and so on.  The queue and its encoding
+     * thread belong to the MTLD3D11DXGIDevice and outlive this object, so
+     * releasing a device right after a Flush() used to free those objects
+     * while the encoding thread was still calling into them.  Wait for every
+     * committed chunk to complete before any member is destroyed.  Chunks
+     * that were never committed are never encoded; the queue drops them. */
+    auto &queue = device_.queue();
+    queue.WaitCPUFence(queue.CurrentSeqId() - 1);
+    D3D11_ASSERT(queue.CoherentSeqId() + 1 >= queue.CurrentSeqId() && "device destroyed with chunks in flight");
+  }
+
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) override {
     return container_->QueryInterface(riid, ppvObject);

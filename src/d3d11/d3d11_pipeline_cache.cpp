@@ -190,8 +190,6 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   ShaderCache& scache_;
 
-  task_scheduler<ThreadpoolWork *> scheduler_;
-
   MTLD3D11Device *device;
   StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState> blend_states;
 
@@ -216,6 +214,12 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   std::unordered_map<ManagedShader, std::unique_ptr<MTLCompiledComputePipeline>> pipelines_cs_;
   dxmt::mutex mutex_cs_;
+
+  /* Declared last so it is destroyed first: its workers compile the shader
+   * variants and pipelines owned by the maps above, and ~task_scheduler joins
+   * them.  Destroyed after those maps, a worker could still be compiling a
+   * pipeline whose storage had already been freed. */
+  task_scheduler<ThreadpoolWork *> scheduler_;
 
   CachedSM50Shader *CreateShader(const void *pBytecode,
                                  uint32_t BytecodeLength) {

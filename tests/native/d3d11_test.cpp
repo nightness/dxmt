@@ -1486,6 +1486,92 @@ test_dynamic_external(Ctx &c) {
   close(fd1);
 }
 
+/* Releases a device while its encoding thread is still behind.  Every draw
+ * binds a blend state no earlier draw used, so each one needs a pipeline
+ * that is still compiling on the pipeline cache's workers when the chunk is
+ * committed; the encoding thread then blocks in GetPipeline() on it.  The
+ * device's last Release() follows the Flush() at once.  The pipelines, the
+ * blend/rasterizer/depth-stencil states and the pipeline cache's workers
+ * belong to the device, so tearing it down before the queue has encoded
+ * those chunks leaves the encoding thread calling into freed pipelines (the
+ * QEMURenderServer crash in FinalizeCurrentRenderPipeline's lambda) and the
+ * workers compiling them.  Passing means surviving the loop. */
+static void
+test_device_release_inflight() {
+  const char *T = "device_release_inflight";
+  const UINT W = 16, H = 16, kIterations = 12, kDraws = 30;
+  for (UINT iter = 0; iter < kIterations; iter++) {
+    Ctx d;
+    if (!create_device(d))
+      return;
+    {
+      D3D11_TEXTURE2D_DESC td = {};
+      td.Width = W;
+      td.Height = H;
+      td.MipLevels = 1;
+      td.ArraySize = 1;
+      td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      td.SampleDesc = {1, 0};
+      td.Usage = D3D11_USAGE_DEFAULT;
+      td.BindFlags = D3D11_BIND_RENDER_TARGET;
+      Com<ID3D11Texture2D> rt;
+      CHECK_HR(T, d.device->CreateTexture2D(&td, nullptr, &rt));
+      Com<ID3D11RenderTargetView> rtv;
+      CHECK_HR(T, d.device->CreateRenderTargetView(rt, nullptr, &rtv));
+      D3D11_BUFFER_DESC bd = {};
+      bd.ByteWidth = sizeof(kQuadFull);
+      bd.Usage = D3D11_USAGE_IMMUTABLE;
+      bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+      D3D11_SUBRESOURCE_DATA init = {kQuadFull, 0, 0};
+      Com<ID3D11Buffer> vb;
+      CHECK_HR(T, d.device->CreateBuffer(&bd, &init, &vb));
+      Com<ID3D11VertexShader> vs;
+      Com<ID3D11PixelShader> ps;
+      Com<ID3D11InputLayout> layout;
+      CHECK_HR(T, d.device->CreateVertexShader(dxbc_vs_pass, sizeof(dxbc_vs_pass), nullptr, &vs));
+      CHECK_HR(T, d.device->CreatePixelShader(dxbc_ps_color, sizeof(dxbc_ps_color), nullptr, &ps));
+      CHECK_HR(T, d.device->CreateInputLayout(kLayout, 3, dxbc_vs_pass, sizeof(dxbc_vs_pass), &layout));
+
+      d.ctx->OMSetRenderTargets(1, &rtv, nullptr);
+      D3D11_VIEWPORT vp = {0, 0, (float)W, (float)H, 0, 1};
+      d.ctx->RSSetViewports(1, &vp);
+      UINT stride = sizeof(Vertex), offset = 0;
+      d.ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+      d.ctx->IASetInputLayout(layout);
+      d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      d.ctx->VSSetShader(vs, nullptr, 0);
+      d.ctx->PSSetShader(ps, nullptr, 0);
+
+      static const D3D11_BLEND kFactors[] = {
+          D3D11_BLEND_ONE, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_DEST_COLOR,
+          D3D11_BLEND_INV_DEST_COLOR, D3D11_BLEND_SRC_COLOR,
+      };
+      for (UINT i = 0; i < kDraws; i++) {
+        D3D11_BLEND_DESC desc = {};
+        desc.RenderTarget[0].BlendEnable = TRUE;
+        desc.RenderTarget[0].SrcBlend = kFactors[i % 6];
+        desc.RenderTarget[0].DestBlend = kFactors[(i / 6) % 6];
+        desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        Com<ID3D11BlendState> blend;
+        CHECK_HR(T, d.device->CreateBlendState(&desc, &blend));
+        float bf[4] = {0, 0, 0, 0};
+        d.ctx->OMSetBlendState(blend, bf, 0xFFFFFFFF);
+        d.ctx->Draw(6, 0);
+      }
+      d.ctx->Flush();
+      d.ctx->ClearState();
+    }
+    /* `d` goes out of scope here: the context's and then the device's last
+     * reference, with the chunks just flushed still being encoded. */
+  }
+  g_passes++;
+  emit("[PASS] %s: %u devices released with draws in flight", T, kIterations);
+}
+
 int
 main(int argc, char **argv) {
   g_out = stdout;
@@ -1544,6 +1630,7 @@ main(int argc, char **argv) {
   test_fence_event(c);
   test_srgb(c);
   test_bc1_texture(c);
+  test_device_release_inflight();
 
   emit("[SUMMARY] passed=%d failed=%d", g_passes, g_fails);
   if (g_out != stdout)
